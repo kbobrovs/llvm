@@ -93,6 +93,7 @@ typedef cl_context cnri_context;
 typedef cl_event cnri_event;
 typedef cl_program cnri_program;
 typedef cl_kernel cnri_kernel;
+typedef cl_device_id cnri_device;
 
 enum { CNRI_SUCCESS = CL_SUCCESS };
 

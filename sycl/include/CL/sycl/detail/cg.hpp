@@ -9,8 +9,10 @@
 #pragma once
 
 #include <CL/sycl/detail/accessor_impl.hpp>
+#include <CL/sycl/detail/common.hpp>
 #include <CL/sycl/detail/helpers.hpp>
 #include <CL/sycl/detail/kernel_desc.hpp>
+#include <CL/sycl/group.hpp>
 #include <CL/sycl/id.hpp>
 #include <CL/sycl/kernel.hpp>
 #include <CL/sycl/nd_item.hpp>
@@ -45,11 +47,12 @@ public:
 class NDRDescT {
   // The method initializes all sizes for dimensions greater than the passed one
   // to the default values, so they will not affect execution.
-  template <int Dims_> void setNDRangeLeftover() {
+  void setNDRangeLeftover(int Dims_) {
     for (int I = Dims_; I < 3; ++I) {
       GlobalSize[I] = 1;
       LocalSize[I] = LocalSize[0] ? 1 : 0;
       GlobalOffset[I] = 0;
+      NumWorkGroups[I] = 0;
     }
   }
 
@@ -61,9 +64,21 @@ public:
       GlobalSize[I] = NumWorkItems[I];
       LocalSize[I] = 0;
       GlobalOffset[I] = 0;
+      NumWorkGroups[I] = 0;
     }
+    setNDRangeLeftover(Dims_);
+    Dims = Dims_;
+  }
 
-    setNDRangeLeftover<Dims_>();
+  template <int Dims_>
+  void set(sycl::range<Dims_> NumWorkItems, sycl::id<Dims_> Offset) {
+    for (int I = 0; I < Dims_; ++I) {
+      GlobalSize[I] = NumWorkItems[I];
+      LocalSize[I] = 0;
+      GlobalOffset[I] = Offset[I];
+      NumWorkGroups[I] = 0;
+    }
+    setNDRangeLeftover(Dims_);
     Dims = Dims_;
   }
 
@@ -72,14 +87,42 @@ public:
       GlobalSize[I] = ExecutionRange.get_global_range()[I];
       LocalSize[I] = ExecutionRange.get_local_range()[I];
       GlobalOffset[I] = ExecutionRange.get_offset()[I];
+      NumWorkGroups[I] = 0;
     }
-    setNDRangeLeftover<Dims_>();
+    setNDRangeLeftover(Dims_);
+    Dims = Dims_;
+  }
+
+  void set(int Dims_, sycl::nd_range<3> ExecutionRange) {
+    for (int I = 0; I < Dims_; ++I) {
+      GlobalSize[I] = ExecutionRange.get_global_range()[I];
+      LocalSize[I] = ExecutionRange.get_local_range()[I];
+      GlobalOffset[I] = ExecutionRange.get_offset()[I];
+      NumWorkGroups[I] = 0;
+    }
+    setNDRangeLeftover(Dims_);
+    Dims = Dims_;
+  }
+
+  template <int Dims_> void setNumWorkGroups(sycl::range<Dims_> N) {
+    for (int I = 0; I < Dims_; ++I) {
+      GlobalSize[I] = 0;
+      // '0' is a mark to adjust before kernel launch when there is enough info:
+      LocalSize[I] = 0;
+      GlobalOffset[I] = 0;
+      NumWorkGroups[I] = N[I];
+    }
+    setNDRangeLeftover(Dims_);
     Dims = Dims_;
   }
 
   sycl::range<3> GlobalSize;
   sycl::range<3> LocalSize;
   sycl::id<3> GlobalOffset;
+  /// Number of workgroups, used to record the number of workgroups from the
+  /// simplest form of parallel_for_work_group. If set, all other fields must be
+  /// zero
+  sycl::range<3> NumWorkGroups;
   size_t Dims;
 };
 
@@ -102,7 +145,20 @@ class HostKernel : public HostKernelBase {
 
 public:
   HostKernel(KernelType Kernel) : MKernel(Kernel) {}
-  void call(const NDRDescT &NDRDesc) override { runOnHost(NDRDesc); }
+  void call(const NDRDescT &NDRDesc) override {
+    // adjust ND range for serial host:
+    NDRDescT R1;
+    bool Adjust = false;
+
+    if (NDRDesc.GlobalSize[0] == 0 && NDRDesc.NumWorkGroups[0] != 0) {
+      // LocalSize - which is the workgroup size - is not set; need to adjust
+      range<3> WGsize = {1, 1, 1}; // no better alternative for serial host?
+      R1.set(NDRDesc.Dims, nd_range<3>(NDRDesc.NumWorkGroups * WGsize, WGsize));
+      Adjust = true;
+    }
+    const NDRDescT &R = Adjust ? R1 : NDRDesc;
+    runOnHost(R);
+  }
 
   char *getPtr() override { return reinterpret_cast<char *>(&MKernel); }
 
@@ -165,6 +221,7 @@ public:
     sycl::id<3> GroupSize;
     for (int I = 0; I < 3; ++I) {
       GroupSize[I] = NDRDesc.GlobalSize[I] / NDRDesc.LocalSize[I];
+      // TODO supoport case NDRDesc.GlobalSize[I] % NDRDesc.LocalSize[I] != 0
     }
 
     sycl::range<Dims> GlobalSize;
@@ -217,6 +274,30 @@ public:
       }
     }
   }
+
+  template <typename ArgT = KernelArgType>
+  enable_if_t<std::is_same<ArgT, cl::sycl::group<Dims>>::value>
+  runOnHost(const NDRDescT &NDRDesc) {
+    sycl::id<Dims> NGroups;
+
+    for (int I = 0; I < Dims; ++I) {
+      NGroups[I] = NDRDesc.GlobalSize[I] / NDRDesc.LocalSize[I];
+      assert(NDRDesc.GlobalSize[I] % NDRDesc.LocalSize[I] == 0);
+    }
+    sycl::range<Dims> GlobalSize;
+    sycl::range<Dims> LocalSize;
+
+    for (int I = 0; I < Dims; ++I) {
+      LocalSize[I] = NDRDesc.LocalSize[I];
+      GlobalSize[I] = NDRDesc.GlobalSize[I];
+    }
+    detail::NDLoop<Dims>::iterate(NGroups, [&](const id<Dims> &GroupID) {
+      sycl::group<Dims> Group =
+          IDBuilder::createGroup<Dims>(GlobalSize, LocalSize, GroupID);
+      MKernel(Group);
+    });
+  }
+
   ~HostKernel() = default;
 };
 
