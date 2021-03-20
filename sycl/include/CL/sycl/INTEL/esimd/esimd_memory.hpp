@@ -23,6 +23,111 @@ namespace sycl {
 namespace INTEL {
 namespace gpu {
 
+// Supporting code for type tag-based cache hint specification in ESIMD memory
+// intrinsics.
+// {
+
+namespace __sig = sycl::INTEL::gpu;
+
+namespace detail {
+// A cache hint "represented" by non-related type.
+struct InvalidCacheHint {
+  static inline constexpr __sig::CacheHint Value =
+      static_cast<__sig::CacheHint>(-1);
+};
+
+// .first is L1 cache hint, .second - L3.
+using CacheHintPair = std::pair<__sig::CacheHint, __sig::CacheHint>;
+} // namespace detail
+
+using namespace sycl::INTEL::gpu::detail;
+
+// Convenience enclosure for the cache hint type tags and supporting code.
+template <int Level> class CacheHintTags {
+private:
+  // Marker base type for all cache hint type tags
+  struct Base {};
+
+public:
+#define DEFINE_TAG_TYPE(Name, EnumVal)                                         \
+  /* All tag types extend Base to easily check if a type is a                  \
+     cache hint tag type using std::is_base_of_v */                            \
+  struct Name final : Base {                                                   \
+    static inline constexpr __sig::CacheHint Value =                           \
+        __sig::CacheHint::EnumVal;                                             \
+  }
+
+  /// No cache hint is used.
+  DEFINE_TAG_TYPE(none, None);
+  // TBD TODO document all the cache hints.
+  DEFINE_TAG_TYPE(uncached, Uncached);
+  DEFINE_TAG_TYPE(write_back, WriteBack);
+  DEFINE_TAG_TYPE(write_through, WriteThrough);
+  DEFINE_TAG_TYPE(streaming, Streaming);
+  DEFINE_TAG_TYPE(read_invalidate, ReadInvalidate);
+
+  // Helper structure which maps tag types to themselves, all other types - to
+  // InvalidCacheHint.
+  template <typename T,
+            bool IsCacheHintTV =
+                std::is_base_of_v<typename CacheHintTags<Level>::Base, T>>
+  struct IsA : std::bool_constant<IsCacheHintTV> {
+    using Type =
+        typename std::conditional<IsCacheHintTV, T, InvalidCacheHint>::type;
+  };
+};
+
+namespace detail {
+// Enforces that:
+// 1) the template parameter pack contains only cache hint tag types
+// 2) at most one L1 and one L3 hint tag type is present
+// Returns the compile-time constant pair of found L1 and L3 hints.
+// "__sig::CacheHint::None" hint value is used if a hint is not present in the
+// pack.
+template <typename... T> constexpr CacheHintPair getCacheHints() {
+  // Disjunction will stop on first type where TT::value is true (TT is the type
+  // returned by IsA) and return it. If none are true, it will return the last
+  // type. ::Type will get the cache hint tag or InvalidCacheHint, ::Value
+  // will further get the cache hint numeric value (-1 for the invalid hint).
+  constexpr __sig::CacheHint L1Hint =
+      std::disjunction<CacheHintTags<1>::IsA<T>...>::Type::Value;
+  constexpr __sig::CacheHint L3Hint =
+      std::disjunction<CacheHintTags<3>::IsA<T>...>::Type::Value;
+
+  constexpr int NL1Hints = L1Hint == InvalidCacheHint::Value ? 0 : 1;
+  constexpr int NL3Hints = L3Hint == InvalidCacheHint::Value ? 0 : 1;
+  constexpr int NArgs = sizeof...(T);
+  static_assert(NL1Hints + NL3Hints == NArgs,
+                "Only cache hint arguments are allowed, and only 0 or 1 "
+                "occurrences each");
+  constexpr CacheHintPair Res = {
+      NL1Hints == 0 ? __sig::CacheHint::None : L1Hint,
+      NL3Hints == 0 ? __sig::CacheHint::None : L3Hint};
+  return Res;
+}
+
+// Specialization of the above for the empty parameter pack.
+template <> constexpr CacheHintPair getCacheHints() {
+  return {__sig::CacheHint::None, __sig::CacheHint::None};
+}
+} // namespace detail
+
+/// Enclosing type for L1 cache type tags. Usage:
+/// \code{.unparsed}
+/// ... some_esimd_memory_api(...,l1_cache_hint::some_cache_hint{});
+/// \endcode
+///
+using l1_cache_hint = CacheHintTags<1>;
+
+/// Enclosing type for L3 cache type tags. Usage:
+/// \code{.unparsed}
+/// ... some_esimd_memory_api(...,l3_cache_hint::some_cache_hint{});
+/// \endcode
+///
+using l3_cache_hint = CacheHintTags<3>;
+
+// } end of cache hint type tag support
+
 template <int ElemsPerAddr,
           typename = sycl::detail::enable_if_t<
               (ElemsPerAddr == 1 || ElemsPerAddr == 2 || ElemsPerAddr == 4)>>
@@ -38,57 +143,19 @@ constexpr unsigned int ElemsPerAddrEncoding() {
   // other cases not needed since enable_if disallows other values
 }
 
-// TODO @Pennycook
-// {quote}
-// ...I'd like us to think more about what we can do to make these interfaces
-// more user - friendly. A user providing cache hints has to provide a lot more
-// template arguments than required.Could we make this nicer by providing the
-// hints as tag - type arguments ?
-// ...
-//   // Without cache hints, type and length can be deduced from offsets
-//   float* p;
-//   simd<uint32_t, 16> offsets;
-//   auto result = flat_load(p, offsets);
-//
-//   // With cache hints as templates, verbosity increases significantly:
-//   // - Providing any cache hint forces the user to specify the type and
-//   length float* p; simd<uint32_t, 16> offsets; auto result =
-//   flat_load<uint32_t, 16, 1, CacheHint::Foo, CacheHint::Bar>(p, offsets);
-//
-//   // With cache hints as tag types, verbosity is reduced:
-//   // - Providing a cache hint does not prevent deduction of type and length
-//   float* p;
-//   simd <uint32_t, 16> offsets;
-//   auto result = flat_load(p, offsets, CacheHint::Foo{});
-//
-// Note also that the templated form prevents a developer from specifying an L3
-// hint without also explicitly specifying an L1 hint. If flat_load accepted a
-// list of hints, it might be possible to refactor the hints to specify them in
-// any order, and it may be more extensible to future cache hints:
-// {/quote}
-//
-// TODO @keryell
-// {quote}
-// An approach a la https ://github.com/chriskohlhoff/propria from
-// @chriskohlhoff would be to add a property to the pointer, such as
-//
-//    auto result = flat_load(p, offsets);
-//    auto result = flat_load(decorate<CacheHint::Foo, CacheHint::Bar>(p),
-//    offsets);
-// The advantage is that you do not have to change all tour API and all the uses
-// of this decorated pointer will benefit from this. decorate is to be bikeshed
-// accordingly.
-// {/quote}
-//
 /// Flat-address gather.
 /// \ingroup sycl_esimd
-template <typename T, int n, int ElemsPerAddr = 1,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <typename T, int n, int ElemsPerAddr = 1, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG typename sycl::detail::enable_if_t<
     ((n == 8 || n == 16 || n == 32) &&
      (ElemsPerAddr == 1 || ElemsPerAddr == 2 || ElemsPerAddr == 4)),
     simd<T, n * ElemsPerAddr>>
-gather(T *p, simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1) {
+gather(T *p, simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1,
+       Tags... tags) {
+
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
 
   simd<uint64_t, n> offsets_i = convert<uint64_t>(offsets);
   simd<uint64_t, n> addrs(reinterpret_cast<uint64_t>(p));
@@ -116,25 +183,24 @@ gather(T *p, simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1) {
         addrs.data(), ElemsPerAddrEncoding<ElemsPerAddr>(), pred.data());
 }
 
-// TODO bring this SVM-based scatter/gather interface in accordance with
-// accessor-based ones - remove the ElemsPerAddr template parameter as it is
-// redundant: the only allowed block size in the underlying BE intrinsics is 1
-// byte with max number of blocks being 4. This means T template parameter alone
-// can model all supported cases.
-
 /// Flat-address scatter.
 /// \ingroup sycl_esimd
-template <typename T, int n, int ElemsPerAddr = 1,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <typename T, int n, int ElemsPerAddr = 1, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG typename sycl::detail::enable_if_t<
     ((n == 8 || n == 16 || n == 32) &&
      (ElemsPerAddr == 1 || ElemsPerAddr == 2 || ElemsPerAddr == 4)),
     void>
 scatter(T *p, simd<T, n * ElemsPerAddr> vals, simd<uint32_t, n> offsets,
-        simd<uint16_t, n> pred = 1) {
+        simd<uint16_t, n> pred = 1, Tags... tags) {
+
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   simd<uint64_t, n> offsets_i = convert<uint64_t>(offsets);
   simd<uint64_t, n> addrs(reinterpret_cast<uint64_t>(p));
   addrs = addrs + offsets_i;
+
   if constexpr (sizeof(T) == 1 && ElemsPerAddr == 2) {
     simd<T, n * 4> D;
     D = __esimd_wrregion<T, n * 4, n * ElemsPerAddr, /*VS*/ 4, 2, 1>(
@@ -170,9 +236,13 @@ scatter(T *p, simd<T, n * ElemsPerAddr> vals, simd<uint32_t, n> offsets,
 //
 /// Flat-address block-load.
 /// \ingroup sycl_esimd
-template <typename T, int n, CacheHint L1H = CacheHint::None,
-          CacheHint L3H = CacheHint::None>
-ESIMD_INLINE ESIMD_NODEBUG simd<T, n> block_load(const T *const addr) {
+template <typename T, int n, typename... Tags>
+ESIMD_INLINE ESIMD_NODEBUG simd<T, n> block_load(const T *const addr,
+                                                 Tags... tags) {
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   constexpr unsigned Sz = sizeof(T) * n;
   static_assert(Sz >= __esimd::OWORD, "block size must be at least 1 oword");
   static_assert(Sz % __esimd::OWORD == 0,
@@ -210,9 +280,13 @@ ESIMD_INLINE ESIMD_NODEBUG simd<T, n> block_load(AccessorTy acc,
 
 /// Flat-address block-store.
 /// \ingroup sycl_esimd
-template <typename T, int n, CacheHint L1H = CacheHint::None,
-          CacheHint L3H = CacheHint::None>
-ESIMD_INLINE ESIMD_NODEBUG void block_store(T *p, simd<T, n> vals) {
+template <typename T, int n, typename... Tags>
+ESIMD_INLINE ESIMD_NODEBUG void block_store(T *p, simd<T, n> vals,
+                                            Tags... tags) {
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   constexpr unsigned Sz = sizeof(T) * n;
   static_assert(Sz >= __esimd::OWORD, "block size must be at least 1 oword");
   static_assert(Sz % __esimd::OWORD == 0,
@@ -264,15 +338,18 @@ ESIMD_INLINE ESIMD_NODEBUG void block_store(AccessorTy acc, uint32_t offset,
 /// compute actual memory access offset for that element.
 ///
 /// \ingroup sycl_esimd
-template <typename T, int N, typename AccessorTy,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <typename T, int N, typename AccessorTy, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG
     typename sycl::detail::enable_if_t<(sizeof(T) <= 4) &&
                                            (N == 1 || N == 8 || N == 16) &&
                                            !std::is_pointer<AccessorTy>::value,
                                        simd<T, N>>
-    gather(AccessorTy acc, simd<uint32_t, N> offsets,
-           uint32_t glob_offset = 0) {
+    gather(AccessorTy acc, simd<uint32_t, N> offsets, uint32_t glob_offset = 0,
+           Tags... tags) {
+
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
 
   constexpr int TypeSizeLog2 =
       sycl::INTEL::gpu::ElemsPerAddrEncoding<sizeof(T)>();
@@ -332,15 +409,19 @@ ESIMD_INLINE ESIMD_NODEBUG
 /// predicates are not written.
 ///
 /// \ingroup sycl_esimd
-template <typename T, int N, typename AccessorTy,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <typename T, int N, typename AccessorTy, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG
     typename sycl::detail::enable_if_t<(sizeof(T) <= 4) &&
                                            (N == 1 || N == 8 || N == 16) &&
                                            !std::is_pointer<AccessorTy>::value,
                                        void>
     scatter(AccessorTy acc, simd<T, N> vals, simd<uint32_t, N> offsets,
-            uint32_t glob_offset = 0, simd<uint16_t, N> pred = 1) {
+            uint32_t glob_offset = 0, simd<uint16_t, N> pred = 1,
+            Tags... tags) {
+
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
 
   constexpr int TypeSizeLog2 =
       sycl::INTEL::gpu::ElemsPerAddrEncoding<sizeof(T)>();
@@ -381,20 +462,19 @@ ESIMD_INLINE ESIMD_NODEBUG
 
 /// Load a scalar value from an accessor.
 /// \ingroup sycl_esimd
-template <typename T, typename AccessorTy, CacheHint L1H = CacheHint::None,
-          CacheHint L3H = CacheHint::None>
-ESIMD_INLINE ESIMD_NODEBUG T scalar_load(AccessorTy acc, uint32_t offset) {
-  const simd<T, 1> Res = gather<T>(acc, simd<uint32_t, 1>{offset});
+template <typename T, typename AccessorTy, typename... Tags>
+ESIMD_INLINE ESIMD_NODEBUG T scalar_load(AccessorTy acc, uint32_t offset,
+                                         Tags... tags) {
+  const simd<T, 1> Res = gather<T>(acc, simd<uint32_t, 1>{offset}, 0, tags...);
   return Res[0];
 }
 
 /// Store a scalar value into an accessor.
 /// \ingroup sycl_esimd
-template <typename T, typename AccessorTy, CacheHint L1H = CacheHint::None,
-          CacheHint L3H = CacheHint::None>
+template <typename T, typename AccessorTy, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG void scalar_store(AccessorTy acc, uint32_t offset,
-                                             T val) {
-  scatter<T>(acc, simd<T, 1>{val}, simd<uint32_t, 1>{offset});
+                                             T val, Tags... tags) {
+  scatter<T>(acc, simd<T, 1>{val}, simd<uint32_t, 1>{offset}, tags...);
 }
 
 // TODO @jasonsewall-intel
@@ -404,12 +484,16 @@ ESIMD_INLINE ESIMD_NODEBUG void scalar_store(AccessorTy acc, uint32_t offset,
 /// Flat-address gather4.
 /// Only allow simd-16 and simd-32.
 /// \ingroup sycl_esimd
-template <typename T, int n, ChannelMaskType Mask,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <typename T, int n, ChannelMaskType Mask, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG
     typename sycl::detail::enable_if_t<(n == 16 || n == 32) && (sizeof(T) == 4),
                                        simd<T, n * NumChannels(Mask)>>
-    gather4(T *p, simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1) {
+    gather4(T *p, simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1,
+            Tags... tags) {
+
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
 
   simd<uint64_t, n> offsets_i = convert<uint64_t>(offsets);
   simd<uint64_t, n> addrs(reinterpret_cast<uint64_t>(p));
@@ -419,13 +503,18 @@ ESIMD_INLINE ESIMD_NODEBUG
 
 /// Flat-address scatter4.
 /// \ingroup sycl_esimd
-template <typename T, int n, ChannelMaskType Mask,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <typename T, int n, ChannelMaskType Mask, typename... Tags>
 ESIMD_INLINE ESIMD_NODEBUG
     typename sycl::detail::enable_if_t<(n == 16 || n == 32) && (sizeof(T) == 4),
                                        void>
     scatter4(T *p, simd<T, n * NumChannels(Mask)> vals,
-             simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1) {
+             simd<uint32_t, n> offsets, simd<uint16_t, n> pred = 1,
+             Tags... tags) {
+
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   simd<uint64_t, n> offsets_i = convert<uint64_t>(offsets);
   simd<uint64_t, n> addrs(reinterpret_cast<uint64_t>(p));
   addrs = addrs + offsets_i;
@@ -433,104 +522,65 @@ ESIMD_INLINE ESIMD_NODEBUG
                                             pred.data());
 }
 
-/// Check the legality of an atomic call in terms of size and type.
-/// \ingroup sycl_esimd
-template <EsimdAtomicOpType Op, typename T, int N, unsigned NumSrc>
-constexpr bool check_atomic() {
-  if constexpr (!__esimd::isPowerOf2(N, 32)) {
-    static_assert((__esimd::isPowerOf2(N, 32)),
-                  "Execution size 1, 2, 4, 8, 16, 32 are supported");
-    return false;
-  }
+namespace detail {
 
-  // No source operand.
+template <EsimdAtomicOpType Op> constexpr size_t get_atomic_n_srcs() {
   if constexpr (Op == EsimdAtomicOpType::ATOMIC_INC ||
-                Op == EsimdAtomicOpType::ATOMIC_DEC) {
-    if constexpr (NumSrc != 0) {
-      static_assert(NumSrc == 0, "No source operands are expected");
-      return false;
-    }
-    if constexpr (!is_type<T, uint16_t, uint32_t, uint64_t>()) {
-      static_assert((is_type<T, uint16_t, uint32_t, uint64_t>()),
-                    "Type UW, UD or UQ is expected");
-      return false;
-    }
-    return true;
+                Op == EsimdAtomicOpType::ATOMIC_DEC)
+    return 0;
+  // One source operand.
+  else if constexpr (Op == EsimdAtomicOpType::ATOMIC_ADD ||
+                     Op == EsimdAtomicOpType::ATOMIC_SUB ||
+                     Op == EsimdAtomicOpType::ATOMIC_MIN ||
+                     Op == EsimdAtomicOpType::ATOMIC_MAX ||
+                     Op == EsimdAtomicOpType::ATOMIC_XCHG ||
+                     Op == EsimdAtomicOpType::ATOMIC_AND ||
+                     Op == EsimdAtomicOpType::ATOMIC_OR ||
+                     Op == EsimdAtomicOpType::ATOMIC_XOR ||
+                     Op == EsimdAtomicOpType::ATOMIC_MINSINT ||
+                     Op == EsimdAtomicOpType::ATOMIC_MAXSINT ||
+                     Op == EsimdAtomicOpType::ATOMIC_FMAX ||
+                     Op == EsimdAtomicOpType::ATOMIC_FMIN)
+    return 1;
+  else {
+    // Two source operands.
+    constexpr bool Is2Src = Op == EsimdAtomicOpType::ATOMIC_CMPXCHG ||
+                            Op == EsimdAtomicOpType::ATOMIC_FCMPWR;
+    static_assert(Is2Src, "unknown atomic operation");
+    return 2;
   }
-
-  // One source integer operand.
-  if constexpr (Op == EsimdAtomicOpType::ATOMIC_ADD ||
-                Op == EsimdAtomicOpType::ATOMIC_SUB ||
-                Op == EsimdAtomicOpType::ATOMIC_MIN ||
-                Op == EsimdAtomicOpType::ATOMIC_MAX ||
-                Op == EsimdAtomicOpType::ATOMIC_XCHG ||
-                Op == EsimdAtomicOpType::ATOMIC_AND ||
-                Op == EsimdAtomicOpType::ATOMIC_OR ||
-                Op == EsimdAtomicOpType::ATOMIC_XOR ||
-                Op == EsimdAtomicOpType::ATOMIC_MINSINT ||
-                Op == EsimdAtomicOpType::ATOMIC_MAXSINT) {
-    if constexpr (NumSrc != 1) {
-      static_assert(NumSrc == 1, "One source operand is expected");
-      return false;
-    }
-    if constexpr ((Op != EsimdAtomicOpType::ATOMIC_MINSINT &&
-                   Op != EsimdAtomicOpType::ATOMIC_MAXSINT) &&
-                  !is_type<T, uint16_t, uint32_t, uint64_t>()) {
-      static_assert((is_type<T, uint16_t, uint32_t, uint64_t>()),
-                    "Type UW, UD or UQ is expected");
-      return false;
-    }
-    if constexpr ((Op == EsimdAtomicOpType::ATOMIC_MINSINT ||
-                   Op == EsimdAtomicOpType::ATOMIC_MAXSINT) &&
-                  !is_type<T, int16_t, int32_t, int64_t>()) {
-      static_assert((is_type<T, int16_t, int32_t, int64_t>()),
-                    "Type W, D or Q is expected");
-      return false;
-    }
-    return true;
-  }
-
-  // One source float operand.
-  if constexpr (Op == EsimdAtomicOpType::ATOMIC_FMAX ||
-                Op == EsimdAtomicOpType::ATOMIC_FMIN) {
-    if constexpr (NumSrc != 1) {
-      static_assert(NumSrc == 1, "One source operand is expected");
-      return false;
-    }
-    if constexpr (!is_type<T, float, cl::sycl::detail::half_impl::StorageT>()) {
-      static_assert(
-          (is_type<T, float, cl::sycl::detail::half_impl::StorageT>()),
-          "Type F or HF is expected");
-      return false;
-    }
-    return true;
-  }
-
-  // Two scouce operands.
-  if constexpr (Op == EsimdAtomicOpType::ATOMIC_CMPXCHG ||
-                Op == EsimdAtomicOpType::ATOMIC_FCMPWR) {
-    if constexpr (NumSrc != 2) {
-      static_assert(NumSrc == 2, "Two source operands are expected");
-      return false;
-    }
-    if constexpr (Op == EsimdAtomicOpType::ATOMIC_CMPXCHG &&
-                  !is_type<T, uint16_t, uint32_t, uint64_t>()) {
-      static_assert((is_type<T, uint16_t, uint32_t, uint64_t>()),
-                    "Type UW, UD or UQ is expected");
-      return false;
-    }
-    if constexpr (Op == EsimdAtomicOpType::ATOMIC_FCMPWR &&
-                  !is_type<T, float, cl::sycl::detail::half_impl::StorageT>()) {
-      static_assert(
-          (is_type<T, float, cl::sycl::detail::half_impl::StorageT>()),
-          "Type F or HF is expected");
-      return false;
-    }
-    return true;
-  }
-  // Unsupported svm atomic Op.
-  return false;
 }
+
+template <EsimdAtomicOpType Op> constexpr bool is_fp_atomic() {
+  return Op == EsimdAtomicOpType::ATOMIC_FMAX ||
+         Op == EsimdAtomicOpType::ATOMIC_FMIN ||
+         Op == EsimdAtomicOpType::ATOMIC_FCMPWR;
+}
+
+template <EsimdAtomicOpType Op> constexpr bool is_signed_int_atomic() {
+  return Op == EsimdAtomicOpType::ATOMIC_MINSINT ||
+         Op == EsimdAtomicOpType::ATOMIC_MAXSINT;
+}
+
+/// Check legality of template arguments of an atomic call.
+/// \ingroup sycl_esimd
+template <EsimdAtomicOpType Op, typename T, int N> void check_atomic() {
+  static_assert((__esimd::isPowerOf2(N, 32)),
+                "Only 1, 2, 4, 8, 16, 32 execution sizes are supported");
+
+  if constexpr (is_fp_atomic<Op>()) {
+    static_assert(is_type<T, float, cl::sycl::detail::half_impl::StorageT>(),
+                  "Half float or float type is expected");
+  } else {
+    if constexpr (is_signed_int_atomic<Op>())
+      static_assert(is_type<T, int16_t, int32_t, int64_t>(),
+                    "signed 2,4,8-byte integer type is expected");
+    else
+      static_assert(is_type<T, uint16_t, uint32_t, uint64_t>(),
+                    "unsigned 2,4,8-byte integer type is expected");
+  }
+}
+} // namespace detail
 
 // TODO @Pennycook
 // {quote}
@@ -542,11 +592,18 @@ constexpr bool check_atomic() {
 
 /// Flat-address atomic, zero source operand: inc and dec.
 /// \ingroup sycl_esimd
-template <EsimdAtomicOpType Op, typename T, int n,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <EsimdAtomicOpType Op, typename T, int n, typename... Tags>
 ESIMD_NODEBUG ESIMD_INLINE
-    typename sycl::detail::enable_if_t<check_atomic<Op, T, n, 0>(), simd<T, n>>
-    flat_atomic(T *p, simd<unsigned, n> offset, simd<ushort, n> pred) {
+    typename sycl::detail::enable_if_t<detail::get_atomic_n_srcs<Op>() == 0,
+                                       simd<T, n>>
+    flat_atomic(T *p, simd<unsigned, n> offset, simd<ushort, n> pred,
+                Tags... tags) {
+
+  detail::check_atomic<Op, T, n>();
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   simd<uintptr_t, n> vAddr(reinterpret_cast<uintptr_t>(p));
   simd<uintptr_t, n> offset_i1 = convert<uintptr_t>(offset);
   vAddr += offset_i1;
@@ -555,12 +612,18 @@ ESIMD_NODEBUG ESIMD_INLINE
 
 /// Flat-address atomic, one source operand, add/sub/min/max etc.
 /// \ingroup sycl_esimd
-template <EsimdAtomicOpType Op, typename T, int n,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <EsimdAtomicOpType Op, typename T, int n, typename... Tags>
 ESIMD_NODEBUG ESIMD_INLINE
-    typename sycl::detail::enable_if_t<check_atomic<Op, T, n, 1>(), simd<T, n>>
+    typename sycl::detail::enable_if_t<detail::get_atomic_n_srcs<Op>() == 1,
+                                       simd<T, n>>
     flat_atomic(T *p, simd<unsigned, n> offset, simd<T, n> src0,
-                simd<ushort, n> pred) {
+                simd<ushort, n> pred, Tags... tags) {
+
+  detail::check_atomic<Op, T, n>();
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   simd<uintptr_t, n> vAddr(reinterpret_cast<uintptr_t>(p));
   simd<uintptr_t, n> offset_i1 = convert<uintptr_t>(offset);
   vAddr += offset_i1;
@@ -570,12 +633,18 @@ ESIMD_NODEBUG ESIMD_INLINE
 
 /// Flat-address atomic, two source operands.
 /// \ingroup sycl_esimd
-template <EsimdAtomicOpType Op, typename T, int n,
-          CacheHint L1H = CacheHint::None, CacheHint L3H = CacheHint::None>
+template <EsimdAtomicOpType Op, typename T, int n, typename... Tags>
 ESIMD_NODEBUG ESIMD_INLINE
-    typename sycl::detail::enable_if_t<check_atomic<Op, T, n, 2>(), simd<T, n>>
+    typename sycl::detail::enable_if_t<detail::get_atomic_n_srcs<Op>() == 2,
+                                       simd<T, n>>
     flat_atomic(T *p, simd<unsigned, n> offset, simd<T, n> src0,
-                simd<T, n> src1, simd<ushort, n> pred) {
+                simd<T, n> src1, simd<ushort, n> pred, Tags... tags) {
+
+  detail::check_atomic<Op, T, n>();
+  constexpr auto L1L3H = detail::getCacheHints<Tags...>();
+  constexpr __sig::CacheHint L1H = L1L3H.first;
+  constexpr __sig::CacheHint L3H = L1L3H.second;
+
   simd<uintptr_t, n> vAddr(reinterpret_cast<uintptr_t>(p));
   simd<uintptr_t, n> offset_i1 = convert<uintptr_t>(offset);
   vAddr += offset_i1;
